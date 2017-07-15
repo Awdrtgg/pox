@@ -21,13 +21,9 @@ ports that aren't on the tree by setting their NO_FLOOD bit.  The result
 is that topologies with loops no longer turn your network into useless
 hot packet soup.
 
-This component is inspired by and roughly based on the description of
-Glenn Gibb's spanning tree module for NOX:
-  http://www.openflow.org/wk/index.php/Basic_Spanning_Tree
-
-Note that this does not have much of a relationship to Spanning Tree
-Protocol.  They have similar purposes, but this is a rather different way
-of going about it.
+The complexity of the original work was O(n^2) and due to some demand 
+I(Awdrtgg) changed it to O(n). There might be (actually I'm sure there is) some 
+problems, fallacies or holes.
 """
 
 from pox.core import core
@@ -41,87 +37,12 @@ import time
 
 log = core.getLogger()
 
-# Might be nice if we made this accessible on core...
-#_adj = defaultdict(lambda:defaultdict(lambda:[]))
-
-def _calc_spanning_tree ():
-  """
-  Calculates the actual spanning tree
-
-  Returns it as dictionary where the keys are DPID1, and the
-  values are tuples of (DPID2, port-num), where port-num
-  is the port on DPID1 connecting to DPID2.
-  """
-  def flip (link):
-    return Discovery.Link(link[2],link[3], link[0],link[1])
-
-  adj = defaultdict(lambda:defaultdict(lambda:[]))
-  switches = set()
-  # Add all links and switches
-  for l in core.openflow_discovery.adjacency:
-    adj[l.dpid1][l.dpid2].append(l)
-    switches.add(l.dpid1)
-    switches.add(l.dpid2)
-
-  # Cull links -- we want a single symmetric link connecting nodes
-  for s1 in switches:
-    for s2 in switches:
-      if s2 not in adj[s1]:
-        continue
-      if not isinstance(adj[s1][s2], list):
-        continue
-      assert s1 is not s2
-      good = False
-      for l in adj[s1][s2]:
-        if flip(l) in core.openflow_discovery.adjacency:
-          # This is a good one
-          adj[s1][s2] = l.port1
-          adj[s2][s1] = l.port2
-          good = True
-          break
-      if not good:
-        del adj[s1][s2]
-        if s1 in adj[s2]:
-          # Delete the other way too
-          del adj[s2][s1]
-
-  q = []
-  more = set(switches)
-
-  done = set()
-
-  tree = defaultdict(set)
-
-  while True:
-    q = sorted(list(more)) + q
-    more.clear()
-    if len(q) == 0: break
-    v = q.pop(False)
-    if v in done: continue
-    done.add(v)
-    for w,p in adj[v].iteritems():
-      if w in tree: continue
-      more.add(w)
-      tree[v].add((w,p))
-      tree[w].add((v,adj[w][v]))
-
-  if False:
-    log.debug("*** SPANNING TREE ***")
-    for sw,ports in tree.iteritems():
-      #print " ", dpidToStr(sw), ":", sorted(list(ports))
-      #print " ", sw, ":", [l[0] for l in sorted(list(ports))]
-      log.debug((" %i : " % sw) + " ".join([str(l[0]) for l in
-                                           sorted(list(ports))]))
-    log.debug("*********************")
-
-  return tree
-
-
 # Keep a list of previous port states so that we can skip some port mods
 # If other things mess with port states, these may not be correct.  We
 # could also refer to Connection.ports, but those are not guaranteed to
 # be up to date.
 _prev = defaultdict(lambda : defaultdict(lambda : None))
+_new = defaultdict(lambda : defaultdict(lambda : None))
 
 # If True, we set ports down when a switch connects
 _noflood_by_default = False
@@ -130,17 +51,23 @@ _noflood_by_default = False
 # cycle should have completed (mostly makes sense with _noflood_by_default).
 _hold_down = False
 
+switches = set()
+sw_union_find = defaultdict()
+connected_pair = []
 
 def _handle_ConnectionUp (event):
   # When a switch connects, forget about previous port states
+  global switches, sw_union_find, _prev, _new, connected_pair
   _prev[event.dpid].clear()
+  _new[event.dpid].clear()
 
   if _noflood_by_default:
     con = event.connection
-    log.debug("Disabling flooding for %i ports", len(con.ports))
     for p in con.ports.itervalues():
       if p.port_no >= of.OFPP_MAX: continue
       _prev[con.dpid][p.port_no] = False
+      _new[con.dpid][p.port_no] = False
+      log.info("switch %i, port %i is no flood", con.dpid, p.port_no)
       pm = of.ofp_port_mod(port_no=p.port_no,
                           hw_addr=p.hw_addr,
                           config = of.OFPPC_NO_FLOOD,
@@ -151,22 +78,126 @@ def _handle_ConnectionUp (event):
   if _hold_down:
     t = Timer(core.openflow_discovery.send_cycle_time + 1, _update_tree,
               kw={'force_dpid':event.dpid})
+  
+  if event.dpid not in switches:
+    switches.add(event.dpid)
+    sw_union_find[event.dpid] = event.dpid 
+    connected_pair.append((event.dpid, event.dpid))
+    log.info("switch %i added", event.dpid) 
 
+def _handle_ConnectionDown (event):
+  # When a switch connects, forget about previous port states
+  global switches, sw_union_find, _prev, _new, connected_pair
+  del _prev[event.dpid]
+  del _new[event.dpid]
+
+  if event.dpid in switches:
+    switches.remove(event.dpid)
+    del sw_union_find[event.dpid]
+    connected_pair.remove((event.dpid, event.dpid))
+    log.info("switch %i deleted", event.dpid)  
+  
+
+def _handle_LinkUp (link):
+  global switches, sw_union_find, _prev, _new, connected_pair
+  def flip (link):
+    return Discovery.Link(link[2],link[3], link[0],link[1])
+  (dp1,p1),(dp2,p2) = link.end
+
+  if flip(link) in core.openflow_discovery.adjacency:
+    if (dp1, dp2) in connected_pair:
+      pass
+    else: 
+      if sw_union_find[dp1] == sw_union_find[dp2]:
+        # They are connected undirectly
+        pass
+      else:
+        # They belong to different subgrph
+        log.info("connect %i & %i", dp1, dp2)
+        # connect dp1 & dp2
+        connected_pair.append((dp1, dp2))
+        connected_pair.append((dp2, dp1)) 
+        _new[dp1][p1] = True
+        _new[dp2][p2] = True
+        if sw_union_find[dp1] < sw_union_find[dp2]:
+          for s in switches:
+            if s is dp2: continue
+            if sw_union_find[s] == sw_union_find[dp2]:
+              sw_union_find[s] = sw_union_find[dp1]
+          sw_union_find[dp2] = sw_union_find[dp1]
+        else:
+          for s in switches:
+            if s is dp1: continue
+            if sw_union_find[s] == sw_union_find[dp1]:
+              sw_union_find[s] = sw_union_find[dp2]
+          sw_union_find[dp1] = sw_union_find[dp2]
+  else:
+    _new[dp1][p1] = False
+    _new[dp2][p2] = False
+
+def _handle_LinkDown (link):
+  global switches, sw_union_find, _prev, _new, connected_pair
+  (dp1,p1),(dp2,p2) = link.end
+  
+  if (dp1, dp2) not in connected_pair:
+    pass
+  else:
+    log.info("disconnect %i & %i", dp1, dp2)
+    _new[dp1][p1] = False
+    _new[dp2][p2] = False
+    connected_pair.remove((dp1, dp2))
+    connected_pair.remove((dp2, dp1))
+
+    if dp1 < dp2:
+      len_neibor_dp2, temp = 1, 0
+      neibor_dp2 = set([dp2])
+      sw_union_find[dp2] = dp2
+      while len_neibor_dp2 <> temp:
+        temp = len_neibor_dp2
+        new_neibor = set()
+        for s1 in switches:
+          if s1 in neibor_dp2: continue 
+          for s2 in neibor_dp2:
+            if (s1, s2) in connected_pair:
+              sw_union_find[s1] = dp2 
+              new_neibor. add(s1)
+          neibor_dp2 = neibor_dp2 | new_neibor
+        len_neibor_dp2 = len(neibor_dp2)
+
+    else:
+      len_neibor_dp1, temp = 1, 0
+      neibor_dp1 = set([dp1])
+      sw_union_find[dp1] = dp1
+      while len_neibor_dp1 <> temp:
+        temp = len_neibor_dp1
+        new_neibor = set()
+        for s1 in switches:
+          if s1 in neibor_dp1: continue 
+          for s2 in neibor_dp1:
+            if (s1, s2) in connected_pair:
+              sw_union_find[s1] = dp1 
+              new_neibor. add(s1)
+          neibor_dp1 = neibor_dp1 | new_neibor
+        len_neibor_dp1 = len(neibor_dp1)
+
+    
 
 def _handle_LinkEvent (event):
   # When links change, update spanning tree
 
   (dp1,p1),(dp2,p2) = event.link.end
-  if _prev[dp1][p1] is False:
-    if _prev[dp2][p2] is False:
-      # We're disabling this link; who cares if it's up or down?
-      #log.debug("Ignoring link status for %s", event.link)
-      return
+  
+  if event.added == 1:
+    _handle_LinkUp(event.link)
+  elif event.removed == 1:
+    _handle_LinkDown(event.link)
 
-  _update_tree()
+  target_dict = set([dp1, dp2])
+
+  _update_tree(update_sw=target_dict)
 
 
-def _update_tree (force_dpid = None):
+def _update_tree (update_sw, force_dpid = None):
   """
   Update spanning tree
 
@@ -174,9 +205,15 @@ def _update_tree (force_dpid = None):
   to be holding down changes.
   """
 
-  # Get a spanning tree
-  tree = _calc_spanning_tree()
+  global switches, sw_union_find, _prev, _new, connected_pair
   log.debug("Spanning tree updated")
+  """
+  log.info(sw_union_find)
+  
+  log.info(_prev)
+  log.info(_new)
+  log.info(connected_pair)
+  """
 
   # Connections born before this time are old enough that a complete
   # discovery cycle should have completed (and, thus, all of their
@@ -186,7 +223,8 @@ def _update_tree (force_dpid = None):
   # Now modify ports as needed
   try:
     change_count = 0
-    for sw, ports in tree.iteritems():
+    for sw in update_sw:
+      ports =  _new[sw]
       con = core.openflow.getConnection(sw)
       if con is None: continue # Must have disconnected
       if con.connect_time is None: continue # Not fully connected
@@ -200,32 +238,46 @@ def _update_tree (force_dpid = None):
           else:
             continue
 
-      tree_ports = [p[1] for p in ports]
+      tree_ports = [p for p in ports.keys()]
       for p in con.ports.itervalues():
         if p.port_no < of.OFPP_MAX:
-          flood = p.port_no in tree_ports
-          if not flood:
+          if p.port_no in tree_ports:
+            flood = _new[sw][p.port_no]
+          else:
             if core.openflow_discovery.is_edge_port(sw, p.port_no):
               flood = True
+            else:
+              flood = False
+
           if _prev[sw][p.port_no] is flood:
-            #print sw,p.port_no,"skip","(",flood,")"
+            """  
+            log.info("%i" % sw + ",%i" % p.port_no + "skip") 
+            """
             continue # Skip
           change_count += 1
           _prev[sw][p.port_no] = flood
+          _new[sw][p.port_no] = flood
           #print sw,p.port_no,flood
           #TODO: Check results
+          """
+          if flood:
+            log.info("switch %i, port %i is flooding", sw, p.port_no)
+          else:
+            log.info("switch %i, port %i is no flood", sw, p.port_no)
+          """
 
           pm = of.ofp_port_mod(port_no=p.port_no,
                                hw_addr=p.hw_addr,
                                config = 0 if flood else of.OFPPC_NO_FLOOD,
-                               mask = of.OFPPC_NO_FLOOD)
+                               mask = of.OFPP_FLOOD)
           con.send(pm)
 
           _invalidate_ports(con.dpid)
     if change_count:
       log.info("%i ports changed", change_count)
   except:
-    _prev.clear()
+    _prev.clear() 
+    _new.clear() 
     log.exception("Couldn't push spanning tree")
 
 
@@ -273,6 +325,7 @@ def launch (no_flood = False, hold_down = False):
 
   def start_spanning_tree ():
     core.openflow.addListenerByName("ConnectionUp", _handle_ConnectionUp)
+    core.openflow.addListenerByName("ConnectionDown", _handle_ConnectionDown)
     core.openflow_discovery.addListenerByName("LinkEvent", _handle_LinkEvent)
     log.debug("Spanning tree component ready")
   core.call_when_ready(start_spanning_tree, "openflow_discovery")
