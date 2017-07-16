@@ -22,7 +22,7 @@ is that topologies with loops no longer turn your network into useless
 hot packet soup.
 
 The complexity of the original work was O(n^2) and due to some demand 
-I(Awdrtgg) changed it to O(n). There might be (actually I'm sure there is) some 
+I changed it to O(n). There might be (actually I'm sure there is) some 
 problems, fallacies or holes.
 """
 
