@@ -244,7 +244,7 @@ class Discovery (EventMixin):
   """
 
   _flow_priority = 65000     # Priority of LLDP-catching flow (if any)
-  _link_timeout = 10         # How long until we consider a link dead
+  _link_timeout = 30         # How long until we consider a link dead
   _timeout_check_period = 5  # How often to check for timeouts
 
   _eventMixin_events = set([
@@ -273,7 +273,7 @@ class Discovery (EventMixin):
 
   @property
   def send_cycle_time (self):
-    return self._link_timeout / 2.0
+    return self._link_timeout / 4.0
 
   def install_flow (self, con_or_dpid, priority = None):
     if priority is None:
