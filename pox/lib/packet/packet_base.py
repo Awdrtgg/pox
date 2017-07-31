@@ -76,17 +76,17 @@ class packet_base (object):
     def msg(self, *args):
         """ Shortcut for logging """
         #TODO: Remove?
-        lg.info(*args)
+        """lg.info(*args)"""
 
     def err(self, *args):
         """ Shortcut for logging """
         #TODO: Remove?
-        lg.error(*args)
+        """lg.error(*args)"""
 
     def warn(self, *args):
         """ Shortcut for logging """
         #TODO: Remove?
-        lg.warning(*args)
+        """lg.warning(*args)"""
 
     def __nonzero__(self):
         return self.parsed is True
